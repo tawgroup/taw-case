@@ -1,0 +1,61 @@
+# taw-case workflow for THIS repo.
+# Engine is shared; this file is the repo's own "definition of done".
+# Edit every gate so it matches how THIS project actually verifies itself.
+
+agent:
+  cmd: pi                 # agent CLI the harness spawns (pi | claude | codex …)
+  # provider: anthropic
+  # model: claude-sonnet-4-6
+  tools: [read, bash, edit, write, grep, find, ls]
+
+settings:
+  max_cycles: 3           # how many implement→verify loops before giving up
+
+workflow:
+  # 1) ACT — agent writes code. It does NOT get to say the gates passed.
+  - id: implement
+    type: agent
+    role: implementer
+
+  # 2) HARD gate — harness runs it; exit code is the source of truth.
+  #    Replace with YOUR real lint command. Agent cannot fake an exit code.
+  - id: lint
+    type: command
+    run: npm run lint
+    pass: { exit_code: 0 }
+    on_fail: implement
+
+  # 3) HARD gate — your real test command. Output is logged + SHA-256 hashed.
+  - id: test
+    type: command
+    run: npm test
+    pass: { exit_code: 0 }
+    on_fail: implement
+
+  # 4) HARD gate — build must succeed (drop this if there's no build step).
+  - id: build
+    type: command
+    run: npm run build
+    pass: { exit_code: 0 }
+    on_fail: implement
+
+  # 5) SOFT gate — agent reviews the diff, must return a JSON verdict + evidence.
+  #    Only runs once the hard gates above have passed.
+  - id: review
+    type: agent
+    role: reviewer
+    gate: true
+    requires: [lint, test, build]
+    on_fail: implement
+
+  # 6) ACT — agent writes a PR-ready summary + collects evidence.
+  - id: close
+    type: agent
+    role: closer
+    requires: [review]
+
+  # 7) ACT — non-blocking: agent records durable lessons into .taw-case/memory/.
+  - id: retro
+    type: agent
+    role: retro
+    blocking: false
