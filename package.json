@@ -1,7 +1,7 @@
 {
   "name": "taw-case",
-  "version": "0.1.0",
-  "description": "A tiny Case-style state-machine harness for Pi coding agents.",
+  "version": "0.2.0",
+  "description": "A Case-style, YAML-driven state-machine harness for coding agents (Pi/Claude/Codex). Agents act, the harness verifies with evidence.",
   "type": "module",
   "bin": {
     "taw-case": "./bin/taw-case.js"
@@ -15,8 +15,13 @@
     "agent",
     "state-machine",
     "harness",
-    "sub-agents"
+    "sub-agents",
+    "evidence",
+    "ci"
   ],
+  "dependencies": {
+    "yaml": "^2.5.0"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=20"

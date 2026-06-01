@@ -1,27 +1,68 @@
 #!/usr/bin/env node
+// taw-case — a Case-style, YAML-driven state-machine harness for coding agents.
+//
+// Mental model: this is a CI-style RUNNER, not a chat app.
+//   You give it ONE task + point it at a repo. It loops through the workflow
+//   defined in <repo>/.taw-case/harness.yaml, spawning an agent (Pi/Claude/…)
+//   for the "agent" steps and running real commands for the "command" steps.
+//   Agents ACT; the harness VERIFIES with exit codes + hashed evidence.
+//   The agent never gets to certify its own work.
+
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  cpSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
 
-const args = parseArgs(process.argv.slice(2));
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PKG_ROOT = resolve(__dirname, "..");
 
-if (args.help || !args.task) {
+const argv = process.argv.slice(2);
+const args = parseArgs(argv);
+
+// ---- subcommands -----------------------------------------------------------
+if (args.help || (!args._cmd && !args.task)) {
   printHelp();
   process.exit(args.help ? 0 : 1);
 }
 
+if (args._cmd === "init") {
+  await cmdInit();
+  process.exit(0);
+}
+
+// ---- main run --------------------------------------------------------------
 const cwd = resolve(args.cwd ?? process.cwd());
-const maxCycles = Number(args["max-cycles"] ?? 3);
-const piBin = args.pi ?? "pi";
-const testCmd = args["test-cmd"];
-const runId = new Date().toISOString().replace(/[:.]/g, "-");
+const configPath = resolve(args.config ?? join(cwd, ".taw-case", "harness.yaml"));
+
+if (!existsSync(configPath)) {
+  console.error(`[taw-case] no config at ${configPath}`);
+  console.error(`[taw-case] run  taw-case init --cwd ${cwd}  to scaffold one.`);
+  process.exit(1);
+}
+
+const config = loadConfig(configPath);
+const steps = config.workflow;
+const stepIndex = Object.fromEntries(steps.map((s, i) => [s.id, i]));
+const maxCycles = Number(args["max-cycles"] ?? config.settings?.max_cycles ?? 3);
+const agentCmd = args["agent-cmd"] ?? config.agent?.cmd ?? "pi";
+
+const runId = stampRunId(args.runid);
 const caseDir = join(cwd, ".taw-case");
 const runDir = join(caseDir, "runs", runId);
 const memoryDir = join(caseDir, "memory");
 
+const firstAgentStep = steps.find((s) => s.type === "agent")?.id ?? steps[0].id;
+
 if (args["dry-run"]) {
-  console.log(`taw-case dry run\n cwd: ${cwd}\n task: ${args.task}\n flow: implement -> verify -> review -> close -> retro`);
+  printDryRun();
   process.exit(0);
 }
 
@@ -33,192 +74,431 @@ const state = {
   cwd,
   runId,
   runDir,
-  cycles: 0,
+  cycle: 1,
   lastFailure: "",
-  testPassed: false,
-  review: null,
+  passed: new Set(),
+  history: [],
 };
 
-await main().catch((error) => {
-  console.error(`\n[taw-case] fatal: ${error?.stack ?? error}`);
+await run().catch((err) => {
+  console.error(`\n[taw-case] fatal: ${err?.stack ?? err}`);
+  writeManifest(false);
   process.exit(1);
 });
 
-async function main() {
-  console.log(`[taw-case] run ${runId}`);
-  console.log(`[taw-case] cwd ${cwd}`);
+// ===========================================================================
 
-  while (state.cycles < maxCycles) {
-    state.cycles += 1;
-    console.log(`\n[taw-case] cycle ${state.cycles}/${maxCycles}: implement`);
-    await implement();
+async function run() {
+  banner();
+  let i = 0;
+  // hard safety cap so a misconfigured on_fail loop can never spin forever
+  const maxTransitions = steps.length * (maxCycles + 2) + 8;
+  let transitions = 0;
 
-    console.log(`\n[taw-case] cycle ${state.cycles}/${maxCycles}: verify`);
-    const verify = await verifyWithTestCommand();
-    state.testPassed = verify.passed;
-    if (!verify.passed) {
-      state.lastFailure = `Verification failed. Exit code: ${verify.exitCode}. See ${verify.outputFile}`;
-      console.log(`[taw-case] verify failed, looping back to implementer`);
+  while (i < steps.length) {
+    if (++transitions > maxTransitions) {
+      throw new Error(`exceeded ${maxTransitions} transitions — likely an on_fail loop in config`);
+    }
+    const step = steps[i];
+
+    // gate on `requires:` — every named prereq must have passed already
+    const missing = (step.requires ?? []).filter((r) => !state.passed.has(r));
+    if (missing.length) {
+      throw new Error(`step "${step.id}" requires [${missing.join(", ")}] which have not passed`);
+    }
+
+    log(`\n▶ ${step.id}  (${describeStep(step)})  cycle ${state.cycle}/${maxCycles}`);
+
+    let result;
+    if (step.type === "command") result = await runCommandStep(step);
+    else if (step.type === "agent") result = await runAgentStep(step);
+    else throw new Error(`unknown step type "${step.type}" in step "${step.id}"`);
+
+    record(step, result);
+
+    if (result.ok) {
+      state.passed.add(step.id);
+      i += 1;
       continue;
     }
 
-    console.log(`\n[taw-case] cycle ${state.cycles}/${maxCycles}: review`);
-    const review = await reviewCode();
-    state.review = review;
-    if (!review.approved) {
-      state.lastFailure = `Review failed: ${(review.issues ?? []).join("; ")}`;
-      writeFileSync(join(runDir, `review-fail-${state.cycles}.json`), JSON.stringify(review, null, 2));
-      console.log(`[taw-case] review failed, looping back to implementer`);
+    // failure
+    if (step.blocking === false) {
+      log(`  ⚠ ${step.id} failed but is non-blocking — continuing`);
+      i += 1;
       continue;
     }
 
-    console.log(`\n[taw-case] close`);
-    await closeRun();
-
-    console.log(`\n[taw-case] retro`);
-    await retro();
-
-    console.log(`\n[taw-case] done. Evidence: ${join(runDir, "summary.md")}`);
-    return;
+    // blocking failure → jump back to on_fail target and burn a cycle
+    state.lastFailure = result.failure ?? `step "${step.id}" failed`;
+    const target = step.on_fail ?? firstAgentStep;
+    state.cycle += 1;
+    if (state.cycle > maxCycles) {
+      log(`\n✗ FAILED after ${maxCycles} cycles at step "${step.id}".`);
+      log(`  last failure: ${state.lastFailure}`);
+      writeManifest(false);
+      log(`  evidence: ${runDir}`);
+      process.exit(2);
+    }
+    log(`  ↩ back to "${target}" (${state.lastFailure})`);
+    // anything past the target is no longer "passed"
+    for (const id of [...state.passed]) {
+      if (stepIndex[id] >= stepIndex[target]) state.passed.delete(id);
+    }
+    i = stepIndex[target];
   }
 
-  await writeSummary(false);
-  console.error(`\n[taw-case] failed after ${maxCycles} cycles. Evidence: ${join(runDir, "summary.md")}`);
-  process.exit(2);
+  log(`\n✓ DONE`);
+  writeManifest(true);
+  log(`  evidence: ${runDir}`);
 }
 
-async function implement() {
-  const prompt = `Task:\n${state.task}\n\nLast failure to fix:\n${state.lastFailure || "None yet."}\n\nYou are the IMPLEMENTER. Modify the repo to satisfy the task. Keep changes focused. Do not claim tests passed; the harness will run verification after you stop.`;
-  await runPi("implementer", prompt, ["read", "bash", "edit", "write", "grep", "find", "ls"]);
+// ---- step runners ----------------------------------------------------------
+
+async function runCommandStep(step) {
+  if (!step.run) throw new Error(`command step "${step.id}" has no \`run\``);
+  const wantCode = step.pass?.exit_code ?? 0;
+  const res = await runShell(step.run, cwd);
+
+  const body =
+    `$ ${step.run}\n\n[exit_code] ${res.code} (expected ${wantCode})\n\n` +
+    `${res.stdout}${res.stderr ? `\n[stderr]\n${res.stderr}` : ""}`;
+  const logFile = join(runDir, `${step.id}.log`);
+  writeFileSync(logFile, body);
+
+  // hashed evidence: prove this exact output, unaltered
+  const sha = sha256(body);
+  writeFileSync(join(runDir, `${step.id}.sha256`), `${sha}  ${logFile}\n`);
+
+  const ok = res.code === wantCode;
+  log(`  exit=${res.code} ${ok ? "✓" : "✗"}  sha256=${sha.slice(0, 12)}…`);
+  return {
+    ok,
+    sha256: sha,
+    exitCode: res.code,
+    logFile,
+    failure: ok ? undefined : `\`${step.run}\` exited ${res.code} (expected ${wantCode}); see ${logFile}`,
+  };
 }
 
-async function verifyWithTestCommand() {
-  if (!testCmd) {
-    const note = "No --test-cmd supplied, so taw-case cannot enforce verification.";
-    writeFileSync(join(runDir, `test-output-${state.cycles}.txt`), note);
-    return { passed: true, exitCode: 0, outputFile: join(runDir, `test-output-${state.cycles}.txt`) };
+async function runAgentStep(step) {
+  const role = step.role ?? step.id;
+  const prompt = buildPrompt(step, role);
+  const out = await runAgent(role, step, prompt);
+  const logFile = join(runDir, `${step.id}.log`);
+  writeFileSync(logFile, out);
+
+  if (step.gate) {
+    // a soft gate: agent must return JSON with an explicit verdict + evidence
+    const verdict = extractJson(out) ?? {
+      approved: false,
+      issues: ["agent did not return parseable JSON verdict"],
+    };
+    writeFileSync(join(runDir, `${step.id}.verdict.json`), JSON.stringify(verdict, null, 2));
+    const ok = verdict.approved === true || verdict.pass === true;
+    log(`  verdict approved=${ok} ${ok ? "✓" : "✗"}`);
+    return {
+      ok,
+      logFile,
+      verdict,
+      failure: ok ? undefined : `${role} rejected: ${(verdict.issues ?? []).join("; ") || "no reason given"}`,
+    };
   }
 
-  const outputFile = join(runDir, `test-output-${state.cycles}.txt`);
-  const result = await runShell(testCmd, cwd);
-  const output = `$ ${testCmd}\n\n[exit_code] ${result.code}\n\n${result.stdout}${result.stderr ? `\n[stderr]\n${result.stderr}` : ""}`;
-  writeFileSync(outputFile, output);
-
-  const digest = createHash("sha256").update(output).digest("hex");
-  const hashFile = join(runDir, `test-output-${state.cycles}.sha256`);
-  writeFileSync(hashFile, `${digest}  ${outputFile}\n`);
-
-  const verified = createHash("sha256").update(readFileSync(outputFile)).digest("hex") === digest;
-  writeFileSync(join(runDir, `verified-${state.cycles}.json`), JSON.stringify({
-    passed: result.code === 0 && verified,
-    exitCode: result.code,
-    outputFile,
-    hashFile,
-    sha256: digest,
-    hashVerified: verified,
-  }, null, 2));
-
-  console.log(`[taw-case] test exit=${result.code} sha256=${digest.slice(0, 12)}...`);
-  return { passed: result.code === 0 && verified, exitCode: result.code, outputFile, hashFile };
+  // an "act" agent (implementer/closer/retro): it ran, harness moves on
+  log(`  ${role} done ✓`);
+  return { ok: true, logFile };
 }
 
-async function reviewCode() {
-  const prompt = `You are the REVIEWER. Review the current repository changes for this task:\n${state.task}\n\nUse git diff and relevant files. Return ONLY compact JSON with this shape:\n{"approved":true|false,"issues":["..."],"summary":"..."}\n\nApprove only if the implementation is focused, safe, and consistent with the task. Do not edit files.`;
-  const output = await runPi("reviewer", prompt, ["read", "bash", "grep", "find", "ls"]);
-  const review = extractJson(output) ?? { approved: false, issues: ["Reviewer did not return parseable JSON."], summary: output.slice(-1000) };
-  writeFileSync(join(runDir, `review-${state.cycles}.json`), JSON.stringify(review, null, 2));
-  console.log(`[taw-case] review approved=${Boolean(review.approved)}`);
-  return review;
+// ---- prompt construction ---------------------------------------------------
+
+function buildPrompt(step, role) {
+  if (step.prompt) {
+    return interpolate(step.prompt) + commonContext(role);
+  }
+  const fn = DEFAULT_PROMPTS[role] ?? DEFAULT_PROMPTS._act;
+  return fn() + commonContext(role);
 }
 
-async function closeRun() {
-  await writeSummary(true);
-}
-
-async function retro() {
-  const memoryFile = join(memoryDir, "general.md");
-  if (!existsSync(memoryFile)) writeFileSync(memoryFile, "# taw-case memory\n\n");
-
-  const prompt = `You are the RETRO agent. Inspect these artifacts and update ${memoryFile} with short lessons for future runs.\n\nRun dir: ${runDir}\nTask: ${state.task}\nCycles: ${state.cycles}\n\nOnly write durable gotchas, not generic advice.`;
-  await runPi("retro", prompt, ["read", "bash", "edit", "write", "grep", "find", "ls"]);
-}
-
-async function writeSummary(success) {
-  const files = [
-    `# taw-case run ${runId}`,
+function commonContext(role) {
+  return [
     "",
-    `- Task: ${state.task}`,
-    `- Cwd: ${cwd}`,
-    `- Success: ${success}`,
-    `- Cycles: ${state.cycles}`,
-    `- Last failure: ${state.lastFailure || "none"}`,
-    `- Review approved: ${state.review ? Boolean(state.review.approved) : "n/a"}`,
-    "",
-    "## Evidence",
-    "",
-    testCmd ? `- Test command: \`${testCmd}\`` : "- Test command: not supplied",
-    `- Run directory: \`${runDir}\``,
-    "- Test outputs and SHA-256 files are stored in the run directory.",
-    "",
-  ];
-  writeFileSync(join(runDir, "summary.md"), files.join("\n"));
+    "--- harness context (read-only) ---",
+    `task: ${state.task}`,
+    `role: ${role}`,
+    `cycle: ${state.cycle}/${maxCycles}`,
+    `run_dir: ${state.runDir}`,
+    `last_failure: ${state.lastFailure || "none"}`,
+    "You are ONE subprocess in a state-machine harness. The harness — not you —",
+    "decides whether this state passes. Do not claim a gate passed; the harness",
+    "runs the real checks after you stop.",
+  ].join("\n");
 }
 
-async function runPi(role, prompt, tools) {
-  const rolePrompt = `You are taw-case/${role}. You are one subprocess in a state-machine harness. Follow your role exactly. The orchestrator, not you, decides whether the state passes.`;
-  const piArgs = ["--no-session", "-p", "--append-system-prompt", rolePrompt, "--tools", tools.join(",")];
-  if (args.provider) piArgs.push("--provider", args.provider);
-  if (args.model) piArgs.push("--model", args.model);
-  if (args.thinking) piArgs.push("--thinking", args.thinking);
-  piArgs.push(prompt);
+const DEFAULT_PROMPTS = {
+  implementer: () =>
+    "You are the IMPLEMENTER. Make focused code changes to satisfy the task. " +
+    "If there is a last_failure, fix exactly that. Keep the diff minimal. " +
+    "Do NOT run or fake the verification gates; just write correct code.",
+  reviewer: () =>
+    "You are the REVIEWER. Inspect the working-tree changes (use `git diff`) for the task. " +
+    "Do NOT edit files. Return ONLY compact JSON:\n" +
+    '{"approved":true|false,"issues":["..."],"evidence":["path:line — why"],"summary":"..."}\n' +
+    "Approve only if the change is focused, correct, and matches the task. " +
+    "Every claim in `issues`/`evidence` must point at a real file:line.",
+  closer: () =>
+    "You are the CLOSER. The gates have passed. Write a PR-ready summary to " +
+    "`.taw-case/runs/<run>/PR_BODY.md` (use the run_dir above): what changed, why, " +
+    "and the evidence (test/lint logs + their sha256 files in run_dir). Do not modify source code.",
+  retro: () =>
+    "You are the RETRO agent. Inspect the logs in run_dir and update " +
+    "`.taw-case/memory/general.md` (and a per-stack file if relevant) with SHORT, durable " +
+    "lessons for future runs (real gotchas only, not generic advice). Keep it tight.",
+  _act: () => "You are an ACT agent. Perform your step for the task, then stop.",
+};
 
-  const result = await runProcess(piBin, piArgs, cwd);
-  const logFile = join(runDir, `${role}-${state.cycles || 0}.log`);
-  writeFileSync(logFile, result.stdout + (result.stderr ? `\n[stderr]\n${result.stderr}` : ""));
-  if (result.code !== 0) throw new Error(`pi ${role} failed with exit code ${result.code}. See ${logFile}`);
-  return result.stdout;
+// ---- agent / shell processes ----------------------------------------------
+
+async function runAgent(role, step, prompt) {
+  const rolePrompt = `You are taw-case/${role}, one subprocess in a deterministic harness.`;
+  // sensible defaults for Pi; override via config.agent.args for other CLIs
+  const base = config.agent?.args ?? ["--no-session", "-p", "--append-system-prompt", rolePrompt];
+  const extra = [];
+  const tools = step.tools ?? config.agent?.tools;
+  if (tools && agentCmd.includes("pi")) extra.push("--tools", Array.isArray(tools) ? tools.join(",") : tools);
+  if (config.agent?.provider) extra.push("--provider", config.agent.provider);
+  if (config.agent?.model) extra.push("--model", config.agent.model);
+  const agentArgs = [...base, ...extra, prompt];
+
+  const res = await runProcess(agentCmd, agentArgs, cwd);
+  if (res.code !== 0) {
+    writeFileSync(join(runDir, `${step.id}.err.log`), res.stdout + "\n[stderr]\n" + res.stderr);
+    throw new Error(`agent "${agentCmd}" (${role}) exited ${res.code}; see ${role}.err.log`);
+  }
+  return res.stdout;
 }
 
 function runShell(command, cwd) {
-  return runProcess(process.platform === "win32" ? "cmd" : "bash", process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-lc", command], cwd);
+  const isWin = process.platform === "win32";
+  return runProcess(
+    isWin ? "cmd" : "bash",
+    isWin ? ["/d", "/s", "/c", command] : ["-lc", command],
+    cwd
+  );
 }
 
-function runProcess(command, args, cwd) {
-  return new Promise((resolvePromise) => {
-    const child = spawn(command, args, { cwd, env: process.env });
+function runProcess(command, processArgs, cwd) {
+  return new Promise((res) => {
+    const child = spawn(command, processArgs, { cwd, env: process.env });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => { const s = String(d); stdout += s; process.stdout.write(s); });
     child.stderr.on("data", (d) => { const s = String(d); stderr += s; process.stderr.write(s); });
-    child.on("close", (code) => resolvePromise({ code: code ?? 1, stdout, stderr }));
-    child.on("error", (error) => resolvePromise({ code: 127, stdout, stderr: `${stderr}\n${error.message}` }));
+    child.on("close", (code) => res({ code: code ?? 1, stdout, stderr }));
+    child.on("error", (e) => res({ code: 127, stdout, stderr: `${stderr}\n${e.message}` }));
   });
 }
 
-function extractJson(text) {
-  const trimmed = text.trim();
-  try { return JSON.parse(trimmed); } catch {}
-  const match = trimmed.match(/\{[\s\S]*\}/);
-  if (!match) return null;
-  try { return JSON.parse(match[0]); } catch { return null; }
+// ---- bookkeeping -----------------------------------------------------------
+
+function record(step, result) {
+  state.history.push({
+    step: step.id,
+    type: step.type,
+    cycle: state.cycle,
+    ok: result.ok,
+    exitCode: result.exitCode,
+    sha256: result.sha256,
+    failure: result.failure,
+  });
 }
 
-function parseArgs(argv) {
+function writeManifest(success) {
+  const manifest = {
+    runId,
+    task: state.task,
+    cwd,
+    success,
+    cycles: state.cycle,
+    config: configPath,
+    agentCmd,
+    history: state.history,
+  };
+  writeFileSync(join(runDir, "manifest.json"), JSON.stringify(manifest, null, 2));
+
+  const md = [
+    `# taw-case run ${runId}`,
+    "",
+    `- task: ${state.task}`,
+    `- repo: ${cwd}`,
+    `- success: ${success}`,
+    `- cycles: ${state.cycle}/${maxCycles}`,
+    `- agent: ${agentCmd}`,
+    "",
+    "## Transitions",
+    "",
+    ...state.history.map(
+      (h) =>
+        `- \`${h.step}\` (${h.type}, cycle ${h.cycle}) → ${h.ok ? "PASS" : "FAIL"}` +
+        (h.sha256 ? ` \`sha256:${h.sha256.slice(0, 12)}…\`` : "") +
+        (h.failure ? ` — ${h.failure}` : "")
+    ),
+    "",
+  ].join("\n");
+  writeFileSync(join(runDir, "summary.md"), md);
+}
+
+// ---- config / init ---------------------------------------------------------
+
+function loadConfig(path) {
+  let cfg;
+  try {
+    cfg = parseYaml(readFileSync(path, "utf8"));
+  } catch (e) {
+    console.error(`[taw-case] cannot parse ${path}: ${e.message}`);
+    process.exit(1);
+  }
+  if (!cfg || !Array.isArray(cfg.workflow) || cfg.workflow.length === 0) {
+    console.error(`[taw-case] config must have a non-empty \`workflow:\` list`);
+    process.exit(1);
+  }
+  const seen = new Set();
+  for (const s of cfg.workflow) {
+    if (!s.id) { console.error("[taw-case] every step needs an `id`"); process.exit(1); }
+    if (seen.has(s.id)) { console.error(`[taw-case] duplicate step id "${s.id}"`); process.exit(1); }
+    seen.add(s.id);
+    if (!["command", "agent"].includes(s.type)) {
+      console.error(`[taw-case] step "${s.id}" has invalid type "${s.type}" (use command|agent)`);
+      process.exit(1);
+    }
+  }
+  // validate on_fail / requires targets
+  for (const s of cfg.workflow) {
+    for (const ref of [s.on_fail, ...(s.requires ?? [])].filter(Boolean)) {
+      if (!seen.has(ref)) {
+        console.error(`[taw-case] step "${s.id}" references unknown step "${ref}"`);
+        process.exit(1);
+      }
+    }
+  }
+  return cfg;
+}
+
+async function cmdInit() {
+  const target = resolve(args.cwd ?? process.cwd());
+  const dest = join(target, ".taw-case");
+  const destCfg = join(dest, "harness.yaml");
+  if (existsSync(destCfg) && !args.force) {
+    console.error(`[taw-case] ${destCfg} already exists (use --force to overwrite)`);
+    process.exit(1);
+  }
+  mkdirSync(dest, { recursive: true });
+  const tpl = join(PKG_ROOT, "templates", "harness.yaml");
+  cpSync(tpl, destCfg);
+  console.log(`[taw-case] wrote ${destCfg}`);
+  console.log(`[taw-case] edit the gates to match THIS repo, then:`);
+  console.log(`  taw-case "your task" --cwd ${target} --dry-run`);
+}
+
+// ---- small helpers ---------------------------------------------------------
+
+function sha256(s) { return createHash("sha256").update(s).digest("hex"); }
+
+function interpolate(s) {
+  return String(s)
+    .replaceAll("{{task}}", state.task ?? "")
+    .replaceAll("{{run_dir}}", state.runDir ?? "")
+    .replaceAll("{{last_failure}}", state.lastFailure ?? "");
+}
+
+function describeStep(step) {
+  if (step.type === "command") return `cmd: ${step.run}`;
+  return step.gate ? `agent gate: ${step.role ?? step.id}` : `agent: ${step.role ?? step.id}`;
+}
+
+function extractJson(text) {
+  const t = text.trim();
+  try { return JSON.parse(t); } catch {}
+  const m = t.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch { return null; }
+}
+
+function stampRunId(given) {
+  if (given) return given;
+  // Date is available here (CLI, not a workflow sandbox)
+  return new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+}
+
+function banner() {
+  log(`[taw-case] run ${runId}`);
+  log(`[taw-case] repo ${cwd}`);
+  log(`[taw-case] task ${state.task}`);
+  log(`[taw-case] agent ${agentCmd} · cycles ${maxCycles} · steps ${steps.map((s) => s.id).join(" → ")}`);
+}
+
+function printDryRun() {
+  console.log(`taw-case dry run`);
+  console.log(`  repo:   ${cwd}`);
+  console.log(`  config: ${configPath}`);
+  console.log(`  task:   ${args.task}`);
+  console.log(`  agent:  ${agentCmd}  (cycles: ${maxCycles})`);
+  console.log(`  flow:`);
+  for (const s of steps) {
+    const tag = s.type === "command" ? "HARD" : s.gate ? "SOFT" : "ACT ";
+    const meta = [];
+    if (s.requires) meta.push(`requires=[${s.requires.join(",")}]`);
+    if (s.on_fail) meta.push(`on_fail=${s.on_fail}`);
+    if (s.blocking === false) meta.push("non-blocking");
+    console.log(`    [${tag}] ${s.id.padEnd(12)} ${describeStep(s)}${meta.length ? "   (" + meta.join(", ") + ")" : ""}`);
+  }
+  console.log(`\n  HARD = harness runs a command, exit code decides (agent can't fake it)`);
+  console.log(`  SOFT = agent returns a JSON verdict + evidence`);
+  console.log(`  ACT  = agent does work, harness moves on`);
+}
+
+function log(s) { console.log(s); }
+
+function parseArgs(av) {
   const out = {};
   const rest = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+  const SUBCMDS = new Set(["init"]);
+  let i = 0;
+  if (av[0] && SUBCMDS.has(av[0])) { out._cmd = av[0]; i = 1; }
+  for (; i < av.length; i++) {
+    const a = av[i];
     if (a === "--help" || a === "-h") out.help = true;
-    else if (a.startsWith("--")) {
-      const key = a.slice(2);
-      if (key === "dry-run") out[key] = true;
-      else out[key] = argv[++i];
-    } else rest.push(a);
+    else if (a === "--dry-run") out["dry-run"] = true;
+    else if (a === "--force") out.force = true;
+    else if (a.startsWith("--")) out[a.slice(2)] = av[++i];
+    else rest.push(a);
   }
   out.task = rest.join(" ").trim();
   return out;
 }
 
 function printHelp() {
-  console.log(`taw-case\n\nUsage:\n  taw-case "task" [options]\n\nOptions:\n  --cwd <dir>            target repo, default current directory\n  --test-cmd <cmd>       command the harness runs for verification\n  --max-cycles <n>       default 3\n  --provider <name>      forwarded to pi\n  --model <name>         forwarded to pi\n  --thinking <level>     forwarded to pi\n  --pi <bin>             Pi binary, default pi\n  --dry-run              print planned flow only\n  --help                 show help\n`);
+  console.log(`taw-case — Case-style state-machine harness for coding agents
+
+USAGE
+  taw-case init [--cwd <repo>] [--force]      scaffold .taw-case/harness.yaml
+  taw-case "<task>" [options]                 run the workflow on a task
+
+OPTIONS
+  --cwd <dir>          target repo (default: current dir)
+  --config <path>      config file (default: <cwd>/.taw-case/harness.yaml)
+  --dry-run            print the resolved flow and exit (no agents, no token cost)
+  --max-cycles <n>     override config max_cycles
+  --agent-cmd <bin>    agent CLI to spawn (default: config agent.cmd or "pi")
+  --help               this help
+
+MODEL
+  Not a chat app — a CI-style runner. Give it ONE task, it loops the workflow:
+  agents ACT, the harness VERIFIES with exit codes + hashed evidence, and an
+  agent never certifies its own work. Each step in harness.yaml is one of:
+    command  → harness runs it; pass = exit code matches (HARD gate)
+    agent    → spawn the agent CLI; with gate:true it must return a JSON verdict
+  Failing a blocking step jumps back to on_fail (default: first agent step) and
+  burns a cycle. Evidence lands in .taw-case/runs/<id>/.
+`);
 }
