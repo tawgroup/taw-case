@@ -1,0 +1,24 @@
+{
+  "name": "taw-case",
+  "version": "0.1.0",
+  "description": "A tiny Case-style state-machine harness for Pi coding agents.",
+  "type": "module",
+  "bin": {
+    "taw-case": "./bin/taw-case.js"
+  },
+  "scripts": {
+    "start": "node bin/taw-case.js",
+    "check": "node --check bin/taw-case.js"
+  },
+  "keywords": [
+    "pi",
+    "agent",
+    "state-machine",
+    "harness",
+    "sub-agents"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}
