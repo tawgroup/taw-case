@@ -506,7 +506,10 @@ function parseArgs(av) {
   let i = 0;
   if (av[0] && SUBCMDS.has(av[0])) { out._cmd = av[0]; i = 1; }
   for (; i < av.length; i++) {
-    const a = av[i];
+    let a = av[i];
+    // macOS "smart dashes" turns --flag into —flag / —-flag / –flag. Heal it:
+    // only when the token STARTS with a dash-like char (won't touch task words).
+    if (/^[—–]/.test(a)) a = a.replace(/^[—–-]+/, "--");
     if (a === "--help" || a === "-h") out.help = true;
     else if (a === "--dry-run") out["dry-run"] = true;
     else if (a === "--force") out.force = true;
