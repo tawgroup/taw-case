@@ -49,7 +49,20 @@ if (!existsSync(configPath)) {
 }
 
 const config = loadConfig(configPath);
-const steps = config.workflow;
+
+// pick which named workflow to run (config may define one or many)
+const workflowNames = Object.keys(config.workflows);
+const workflowName =
+  args.workflow ??
+  config.default_workflow ??
+  (workflowNames.length === 1 ? workflowNames[0] : "default");
+const steps = config.workflows[workflowName];
+if (!steps) {
+  console.error(`[taw-case] no workflow "${workflowName}". Available: ${workflowNames.join(", ")}`);
+  console.error(`[taw-case] choose one with --workflow <name>`);
+  process.exit(1);
+}
+
 const stepIndex = Object.fromEntries(steps.map((s, i) => [s.id, i]));
 const maxCycles = Number(args["max-cycles"] ?? config.settings?.max_cycles ?? 3);
 const agentCmd = args["agent-cmd"] ?? config.agent?.cmd ?? "pi";
@@ -58,6 +71,10 @@ const runId = stampRunId(args.runid);
 const caseDir = join(cwd, ".taw-case");
 const runDir = join(caseDir, "runs", runId);
 const memoryDir = join(caseDir, "memory");
+
+// conventions.md (if present) becomes the rubric injected into every SOFT gate
+const conventionsFile = join(caseDir, "conventions.md");
+const conventions = existsSync(conventionsFile) ? readFileSync(conventionsFile, "utf8") : "";
 
 const firstAgentStep = steps.find((s) => s.type === "agent")?.id ?? steps[0].id;
 
@@ -213,11 +230,15 @@ async function runAgentStep(step) {
 // ---- prompt construction ---------------------------------------------------
 
 function buildPrompt(step, role) {
-  if (step.prompt) {
-    return interpolate(step.prompt) + commonContext(role);
-  }
-  const fn = DEFAULT_PROMPTS[role] ?? DEFAULT_PROMPTS._act;
-  return fn() + commonContext(role);
+  const base = step.prompt
+    ? interpolate(step.prompt)
+    : (DEFAULT_PROMPTS[role] ?? DEFAULT_PROMPTS._act)();
+  // SOFT gates get the repo's conventions.md appended as a review rubric
+  const rubric =
+    step.gate && conventions
+      ? `\n\n--- REVIEW RUBRIC (.taw-case/conventions.md) ---\n${conventions}\n--- end rubric ---\nJudge the diff against EVERY rule above; cite file:line for each issue.`
+      : "";
+  return base + rubric + commonContext(role);
 }
 
 function commonContext(role) {
@@ -358,30 +379,46 @@ function loadConfig(path) {
     console.error(`[taw-case] cannot parse ${path}: ${e.message}`);
     process.exit(1);
   }
-  if (!cfg || !Array.isArray(cfg.workflow) || cfg.workflow.length === 0) {
-    console.error(`[taw-case] config must have a non-empty \`workflow:\` list`);
-    process.exit(1);
+  if (!cfg) die("config is empty");
+
+  // normalize to a { name: steps[] } map.
+  //   workflows: { feature: [...], hotfix: [...] }   (multi, named)
+  //   workflow:  [...]                                (single, becomes "default")
+  if (cfg.workflows && typeof cfg.workflows === "object") {
+    if (Array.isArray(cfg.workflow)) cfg.workflows.default = cfg.workflow;
+  } else if (Array.isArray(cfg.workflow)) {
+    cfg.workflows = { default: cfg.workflow };
+  } else {
+    die("config must have a `workflow:` list or a `workflows:` map");
   }
-  const seen = new Set();
-  for (const s of cfg.workflow) {
-    if (!s.id) { console.error("[taw-case] every step needs an `id`"); process.exit(1); }
-    if (seen.has(s.id)) { console.error(`[taw-case] duplicate step id "${s.id}"`); process.exit(1); }
-    seen.add(s.id);
-    if (!["command", "agent"].includes(s.type)) {
-      console.error(`[taw-case] step "${s.id}" has invalid type "${s.type}" (use command|agent)`);
-      process.exit(1);
-    }
-  }
-  // validate on_fail / requires targets
-  for (const s of cfg.workflow) {
-    for (const ref of [s.on_fail, ...(s.requires ?? [])].filter(Boolean)) {
-      if (!seen.has(ref)) {
-        console.error(`[taw-case] step "${s.id}" references unknown step "${ref}"`);
-        process.exit(1);
-      }
-    }
+
+  for (const [name, list] of Object.entries(cfg.workflows)) {
+    if (!Array.isArray(list) || list.length === 0) die(`workflow "${name}" must be a non-empty list`);
+    validateWorkflow(name, list);
   }
   return cfg;
+}
+
+function validateWorkflow(name, list) {
+  const seen = new Set();
+  for (const s of list) {
+    if (!s.id) die(`workflow "${name}": every step needs an \`id\``);
+    if (seen.has(s.id)) die(`workflow "${name}": duplicate step id "${s.id}"`);
+    seen.add(s.id);
+    if (!["command", "agent"].includes(s.type)) {
+      die(`workflow "${name}": step "${s.id}" has invalid type "${s.type}" (use command|agent)`);
+    }
+  }
+  for (const s of list) {
+    for (const ref of [s.on_fail, ...(s.requires ?? [])].filter(Boolean)) {
+      if (!seen.has(ref)) die(`workflow "${name}": step "${s.id}" references unknown step "${ref}"`);
+    }
+  }
+}
+
+function die(msg) {
+  console.error(`[taw-case] ${msg}`);
+  process.exit(1);
 }
 
 async function cmdInit() {
@@ -434,15 +471,18 @@ function banner() {
   log(`[taw-case] run ${runId}`);
   log(`[taw-case] repo ${cwd}`);
   log(`[taw-case] task ${state.task}`);
+  log(`[taw-case] workflow "${workflowName}"${conventions ? " · conventions.md loaded" : ""}`);
   log(`[taw-case] agent ${agentCmd} · cycles ${maxCycles} · steps ${steps.map((s) => s.id).join(" → ")}`);
 }
 
 function printDryRun() {
   console.log(`taw-case dry run`);
-  console.log(`  repo:   ${cwd}`);
-  console.log(`  config: ${configPath}`);
-  console.log(`  task:   ${args.task}`);
-  console.log(`  agent:  ${agentCmd}  (cycles: ${maxCycles})`);
+  console.log(`  repo:     ${cwd}`);
+  console.log(`  config:   ${configPath}`);
+  console.log(`  task:     ${args.task}`);
+  console.log(`  workflow: ${workflowName}  (available: ${workflowNames.join(", ")})`);
+  console.log(`  rubric:   ${conventions ? "conventions.md → injected into SOFT gates" : "none"}`);
+  console.log(`  agent:    ${agentCmd}  (cycles: ${maxCycles})`);
   console.log(`  flow:`);
   for (const s of steps) {
     const tag = s.type === "command" ? "HARD" : s.gate ? "SOFT" : "ACT ";
@@ -487,6 +527,7 @@ USAGE
 OPTIONS
   --cwd <dir>          target repo (default: current dir)
   --config <path>      config file (default: <cwd>/.taw-case/harness.yaml)
+  --workflow <name>    which named workflow to run (default: the only one / "default")
   --dry-run            print the resolved flow and exit (no agents, no token cost)
   --max-cycles <n>     override config max_cycles
   --agent-cmd <bin>    agent CLI to spawn (default: config agent.cmd or "pi")
