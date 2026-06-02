@@ -1,6 +1,6 @@
 {
   "name": "taw-case",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "A Case-style, YAML-driven state-machine harness for coding agents (Pi/Claude/Codex). Agents act, the harness verifies with evidence.",
   "type": "module",
   "bin": {

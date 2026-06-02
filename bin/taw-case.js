@@ -291,6 +291,10 @@ async function runAgent(role, step, prompt) {
   const extra = [];
   const tools = step.tools ?? config.agent?.tools;
   if (tools && agentCmd.includes("pi")) extra.push("--tools", Array.isArray(tools) ? tools.join(",") : tools);
+  // skills: global (agent.skills) + per-step (step.skills). Each → one --skill <path>.
+  if (agentCmd.includes("pi")) {
+    for (const s of [...(config.agent?.skills ?? []), ...(step.skills ?? [])]) extra.push("--skill", s);
+  }
   if (config.agent?.provider) extra.push("--provider", config.agent.provider);
   if (config.agent?.model) extra.push("--model", config.agent.model);
   const agentArgs = [...base, ...extra, prompt];
