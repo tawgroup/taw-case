@@ -286,7 +286,9 @@ const DEFAULT_PROMPTS = {
     "If there is a last_failure, fix exactly that. Keep the diff minimal. " +
     "Do NOT run or fake the verification gates; just write correct code.",
   reviewer: () =>
-    "You are the REVIEWER. Inspect the working-tree changes (use `git diff`) for the task. " +
+    "You are the REVIEWER. Inspect the working-tree changes for the task. Run BOTH " +
+    "`git status --short` AND `git diff` — `git diff` does NOT show NEW untracked files, " +
+    "so for any added file, READ it directly; a file that exists on disk is NOT missing. " +
     "Do NOT edit files. Return ONLY compact JSON:\n" +
     '{"approved":true|false,"issues":["..."],"evidence":["path:line — why"],"summary":"..."}\n' +
     "Approve only if the change is focused, correct, and matches the task. " +
@@ -364,9 +366,12 @@ function runAgentStream(command, processArgs, cwd, stepId) {
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         if (!line.trim()) continue;
-        raw += line + "\n";
         let ev;
         try { ev = JSON.parse(line); } catch { continue; }
+        // Evidence: keep only meaningful events, NOT the per-token delta firehose
+        // (`message_update` echoes the whole message each token → O(n²); a long
+        // turn overflows V8's max string length → RangeError). Cap as a backstop.
+        if (ev.type !== "message_update" && raw.length < 8_000_000) raw += line + "\n";
         handleEvent(ev);
       }
     });
@@ -380,7 +385,7 @@ function runAgentStream(command, processArgs, cwd, stepId) {
       } else if (ev.type === "message_end" && ev.message?.role === "assistant") {
         const txt = (ev.message.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
         if (txt.trim()) {
-          assistantText += txt;
+          if (assistantText.length < 4_000_000) assistantText += txt;
           const oneLine = txt.trim().replace(/\s+/g, " ");
           log(`  💬 ${oneLine.slice(0, 200)}${oneLine.length > 200 ? "…" : ""}`);
         }
