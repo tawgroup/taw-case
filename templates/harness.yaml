@@ -9,7 +9,10 @@ agent:
   tools: [read, bash, edit, write, grep, find, ls]
 
 settings:
-  max_cycles: 3           # how many implement→verify loops before giving up
+  max_cycles: 3           # how many implement→verify loops on a REAL failure before giving up
+  timeout: 900            # per-step hard wall (seconds); a stuck step is killed, not hung (0 = off)
+  gate_retries: 2         # SOFT gate returned unparseable JSON → re-run the gate this many
+                          # times (NOT re-code) before treating it as a real failure
 
 workflow:
   # 1) ACT — agent writes code. It does NOT get to say the gates passed.
