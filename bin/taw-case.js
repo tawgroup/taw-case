@@ -475,7 +475,7 @@ function banner() {
   log(`[taw-case] run ${runId}`);
   log(`[taw-case] repo ${cwd}`);
   log(`[taw-case] task ${state.task}`);
-  log(`[taw-case] workflow "${workflowName}"${conventions ? " · conventions.md loaded" : ""}`);
+  log(`[taw-case] workflow "${workflowName}"${conventions ? " · conventions loaded" : ""}`);
   log(`[taw-case] agent ${agentCmd} · cycles ${maxCycles} · steps ${steps.map((s) => s.id).join(" → ")}`);
 }
 
@@ -485,7 +485,7 @@ function printDryRun() {
   console.log(`  config:   ${configPath}`);
   console.log(`  task:     ${args.task}`);
   console.log(`  workflow: ${workflowName}  (available: ${workflowNames.join(", ")})`);
-  console.log(`  rubric:   ${conventions ? "conventions.md → injected into SOFT gates" : "none"}`);
+  console.log(`  rubric:   ${conventions ? "conventions loaded → injected into `conventions:true` + SOFT gates" : "none"}`);
   console.log(`  agent:    ${agentCmd}  (cycles: ${maxCycles})`);
   console.log(`  flow:`);
   for (const s of steps) {
