@@ -237,9 +237,9 @@ function buildPrompt(step, role) {
   const base = step.prompt
     ? interpolate(step.prompt)
     : (DEFAULT_PROMPTS[role] ?? DEFAULT_PROMPTS._act)();
-  // inject conventions into steps that opt in (conventions: true) and into every
-  // SOFT gate (the reviewer's rubric). `conventions: false` opts a gate out.
-  const wantConv = conventions && step.conventions !== false && (step.conventions === true || step.gate);
+  // EXPLICIT only: conventions are injected iff the step declares `conventions: true`.
+  // No implicit behavior — a step gets conventions only when it says so.
+  const wantConv = conventions && step.conventions === true;
   const convBlock = wantConv
     ? `\n\n--- PROJECT CONVENTIONS ---\n${conventions}\n--- end conventions ---` +
       (step.gate ? `\nJudge the diff against EVERY rule above; cite file:line for each issue.` : "")
@@ -516,7 +516,7 @@ function printDryRun() {
   console.log(`  config:   ${configPath}`);
   console.log(`  task:     ${args.task}`);
   console.log(`  workflow: ${workflowName}  (available: ${workflowNames.join(", ")})`);
-  console.log(`  rubric:   ${conventions ? "conventions loaded → injected into `conventions:true` + SOFT gates" : "none"}`);
+  console.log(`  rubric:   ${conventions ? "conventions loaded → injected only into steps with `conventions: true`" : "none"}`);
   console.log(`  agent:    ${agentCmd}  (cycles: ${maxCycles})`);
   console.log(`  flow:`);
   for (const s of steps) {
