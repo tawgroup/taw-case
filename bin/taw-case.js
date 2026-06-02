@@ -97,11 +97,9 @@ const state = {
   history: [],
 };
 
-await run().catch((err) => {
-  console.error(`\n[taw-case] fatal: ${err?.stack ?? err}`);
-  writeManifest(false);
-  process.exit(1);
-});
+// NOTE: the actual `await run()` is at the very bottom of this file, so that
+// every top-level `const` (DEFAULT_PROMPTS, helpers) is initialized first.
+// (const is not hoisted — calling run() up here hit a TDZ on DEFAULT_PROMPTS.)
 
 // ===========================================================================
 
