@@ -66,6 +66,8 @@ if (!steps) {
 const stepIndex = Object.fromEntries(steps.map((s, i) => [s.id, i]));
 const maxCycles = Number(args["max-cycles"] ?? config.settings?.max_cycles ?? 3);
 const agentCmd = args["agent-cmd"] ?? config.agent?.cmd ?? "pi";
+// per-step hard wall (seconds → ms). 0 disables. Default 15 min.
+const stepTimeoutMs = Number(args.timeout ?? config.settings?.timeout ?? 900) * 1000;
 
 const runId = stampRunId(args.runid);
 const caseDir = join(cwd, ".taw-case");
@@ -321,10 +323,28 @@ function runProcess(command, processArgs, cwd) {
     const child = spawn(command, processArgs, { cwd, env: process.env });
     let stdout = "";
     let stderr = "";
+    let done = false;
+    const finish = (code) => { if (done) return; done = true; res({ code: code ?? 1, stdout, stderr }); };
+
     child.stdout.on("data", (d) => { const s = String(d); stdout += s; process.stdout.write(s); });
     child.stderr.on("data", (d) => { const s = String(d); stderr += s; process.stderr.write(s); });
-    child.on("close", (code) => res({ code: code ?? 1, stdout, stderr }));
-    child.on("error", (e) => res({ code: 127, stdout, stderr: `${stderr}\n${e.message}` }));
+
+    // 'close' = stdio fully flushed (ideal). But if the agent leaves a child
+    // process holding the stdout pipe, 'close' NEVER fires — so also resolve on
+    // 'exit' (the process itself ended) after a short grace to flush late output.
+    child.on("close", (code) => finish(code));
+    child.on("exit", (code) => setTimeout(() => finish(code), 1500));
+    child.on("error", (e) => { stderr += `\n${e.message}`; finish(127); });
+
+    // hard wall: a genuinely stuck process can never hang the harness forever.
+    if (stepTimeoutMs > 0) {
+      setTimeout(() => {
+        if (done) return;
+        try { child.kill("SIGKILL"); } catch {}
+        stderr += `\n[taw-case] killed: step exceeded ${stepTimeoutMs / 1000}s`;
+        finish(124);
+      }, stepTimeoutMs);
+    }
   });
 }
 
@@ -541,6 +561,7 @@ OPTIONS
   --workflow <name>    which named workflow to run (default: the only one / "default")
   --dry-run            print the resolved flow and exit (no agents, no token cost)
   --max-cycles <n>     override config max_cycles
+  --timeout <seconds>  per-step hard wall (default 900; 0 disables)
   --agent-cmd <bin>    agent CLI to spawn (default: config agent.cmd or "pi")
   --help               this help
 
