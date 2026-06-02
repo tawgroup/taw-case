@@ -68,6 +68,8 @@ const maxCycles = Number(args["max-cycles"] ?? config.settings?.max_cycles ?? 3)
 const agentCmd = args["agent-cmd"] ?? config.agent?.cmd ?? "pi";
 // per-step hard wall (seconds → ms). 0 disables. Default 15 min.
 const stepTimeoutMs = Number(args.timeout ?? config.settings?.timeout ?? 900) * 1000;
+// how many times to re-run a SOFT gate that returned unparseable JSON before giving up
+const maxGateRetries = Number(config.settings?.gate_retries ?? 2);
 
 const runId = stampRunId(args.runid);
 const caseDir = join(cwd, ".taw-case");
@@ -140,9 +142,20 @@ async function run() {
 
     if (result.ok) {
       state.passed.add(step.id);
+      formatRetries = 0;
       i += 1;
       continue;
     }
+
+    // A gate that produced UNPARSEABLE output is the reviewer's fault, not the
+    // code's — re-run the SAME gate (don't re-code, don't burn a cycle). Only
+    // after it keeps failing to return valid JSON do we treat it as a real fail.
+    if (step.gate && result.malformed && formatRetries < maxGateRetries) {
+      formatRetries += 1;
+      log(`  ⚠ verdict was not valid JSON — re-running "${step.id}" (${formatRetries}/${maxGateRetries}); NOT re-coding`);
+      continue; // i and cycle unchanged → just re-run this gate
+    }
+    formatRetries = 0;
 
     // failure
     if (step.blocking === false) {
@@ -212,15 +225,19 @@ async function runAgentStep(step) {
 
   if (step.gate) {
     // a soft gate: agent must return JSON with an explicit verdict + evidence
-    const verdict = extractJson(out) ?? {
+    const parsed = extractJson(out);
+    const verdict = parsed ?? {
       approved: false,
       issues: ["agent did not return parseable JSON verdict"],
     };
     writeFileSync(join(runDir, `${step.id}.verdict.json`), JSON.stringify(verdict, null, 2));
     const ok = verdict.approved === true || verdict.pass === true;
-    log(`  verdict approved=${ok} ${ok ? "✓" : "✗"}`);
+    // malformed = the gate didn't even produce valid JSON (reviewer's fault, not the code's)
+    const malformed = !parsed;
+    log(`  verdict ${malformed ? "UNPARSEABLE" : `approved=${ok}`} ${ok ? "✓" : "✗"}`);
     return {
       ok,
+      malformed,
       logFile,
       verdict,
       failure: ok ? undefined : `${role} rejected: ${(verdict.issues ?? []).join("; ") || "no reason given"}`,
