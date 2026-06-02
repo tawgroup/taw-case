@@ -311,8 +311,11 @@ async function runAgent(role, step, prompt) {
   // auto-loading the repo's CLAUDE.md or wandering skill discovery (that made
   // runs take 20+ min). Conventions come from our injected prompt; skills are
   // opt-in via config `skills:` (explicit --skill loads even with discovery off).
+  // --mode json streams structured events so we can show LIVE progress (text
+  // mode stays silent until the agent exits). --no-context-files / --no-skills
+  // keep spawns deterministic and fast (no CLAUDE.md auto-load / skill wander).
   const base = config.agent?.args ?? [
-    "--no-session", "-p", "--no-context-files", "--no-skills",
+    "--no-session", "-p", "--mode", "json", "--no-context-files", "--no-skills",
     "--append-system-prompt", rolePrompt,
   ];
   const extra = [];
@@ -326,12 +329,77 @@ async function runAgent(role, step, prompt) {
   if (config.agent?.model) extra.push("--model", config.agent.model);
   const agentArgs = [...base, ...extra, prompt];
 
-  const res = await runProcess(agentCmd, agentArgs, cwd);
+  const mi = agentArgs.indexOf("--mode");
+  const jsonMode = mi >= 0 && agentArgs[mi + 1] === "json";
+
+  const res = jsonMode
+    ? await runAgentStream(agentCmd, agentArgs, cwd, step.id)
+    : await runProcess(agentCmd, agentArgs, cwd);
+  const out = jsonMode ? res.text : res.stdout;
   if (res.code !== 0) {
-    writeFileSync(join(runDir, `${step.id}.err.log`), res.stdout + "\n[stderr]\n" + res.stderr);
-    throw new Error(`agent "${agentCmd}" (${role}) exited ${res.code}; see ${role}.err.log`);
+    writeFileSync(join(runDir, `${step.id}.err.log`), (out || "") + "\n[stderr]\n" + (res.stderr || ""));
+    throw new Error(`agent "${agentCmd}" (${role}) exited ${res.code}; see ${step.id}.err.log`);
   }
-  return res.stdout;
+  return out;
+}
+
+// Spawn an agent in --mode json: stream structured events to friendly live
+// progress lines, accumulate the assistant's text (the answer / verdict), and
+// keep the raw JSONL as evidence. Resolves { code, text, stderr }.
+function runAgentStream(command, processArgs, cwd, stepId) {
+  return new Promise((res) => {
+    const child = spawn(command, processArgs, { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] }); // stdin ignored: pi waits forever on an open stdin
+    let buf = "", raw = "", assistantText = "", stderr = "", done = false;
+    const finish = (code) => {
+      if (done) return;
+      done = true;
+      if (stepId) try { writeFileSync(join(runDir, `${stepId}.jsonl`), raw); } catch {}
+      res({ code: code ?? 1, text: assistantText.trim(), stderr });
+    };
+
+    child.stdout.on("data", (d) => {
+      buf += String(d);
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        raw += line + "\n";
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        handleEvent(ev);
+      }
+    });
+
+    function handleEvent(ev) {
+      if (ev.type === "tool_execution_start") {
+        const a = ev.args && typeof ev.args === "object"
+          ? Object.values(ev.args).filter((v) => typeof v === "string").join(" ").slice(0, 70)
+          : "";
+        log(`  ⚙ ${ev.toolName}${a ? " " + a : ""}`);
+      } else if (ev.type === "message_end" && ev.message?.role === "assistant") {
+        const txt = (ev.message.content || []).filter((c) => c.type === "text").map((c) => c.text).join("");
+        if (txt.trim()) {
+          assistantText += txt;
+          const oneLine = txt.trim().replace(/\s+/g, " ");
+          log(`  💬 ${oneLine.slice(0, 200)}${oneLine.length > 200 ? "…" : ""}`);
+        }
+      }
+    }
+
+    child.stderr.on("data", (d) => { stderr += String(d); });
+    child.on("close", (code) => finish(code));
+    child.on("exit", (code) => setTimeout(() => finish(code), 1500));
+    child.on("error", (e) => { stderr += `\n${e.message}`; finish(127); });
+    if (stepTimeoutMs > 0) {
+      setTimeout(() => {
+        if (done) return;
+        try { child.kill("SIGKILL"); } catch {}
+        stderr += `\n[taw-case] killed: step exceeded ${stepTimeoutMs / 1000}s`;
+        finish(124);
+      }, stepTimeoutMs);
+    }
+  });
 }
 
 function runShell(command, cwd) {
@@ -345,7 +413,7 @@ function runShell(command, cwd) {
 
 function runProcess(command, processArgs, cwd) {
   return new Promise((res) => {
-    const child = spawn(command, processArgs, { cwd, env: process.env });
+    const child = spawn(command, processArgs, { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] }); // stdin ignored: pi waits forever on an open stdin
     let stdout = "";
     let stderr = "";
     let done = false;
