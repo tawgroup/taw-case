@@ -115,6 +115,7 @@ async function run() {
   // hard safety cap so a misconfigured on_fail loop can never spin forever
   const maxTransitions = steps.length * (maxCycles + 2) + 8;
   let transitions = 0;
+  let formatRetries = 0; // re-runs of the CURRENT gate due to unparseable verdict
 
   while (i < steps.length) {
     if (++transitions > maxTransitions) {
