@@ -72,9 +72,13 @@ const caseDir = join(cwd, ".taw-case");
 const runDir = join(caseDir, "runs", runId);
 const memoryDir = join(caseDir, "memory");
 
-// conventions.md (if present) becomes the rubric injected into every SOFT gate
+// conventions: prefer the inline `conventions:` block in harness.yaml (self-contained),
+// fall back to .taw-case/conventions.md. Injected into agent steps that opt in
+// (conventions: true) and into every SOFT gate (the reviewer's rubric).
 const conventionsFile = join(caseDir, "conventions.md");
-const conventions = existsSync(conventionsFile) ? readFileSync(conventionsFile, "utf8") : "";
+const conventions =
+  (typeof config.conventions === "string" ? config.conventions : "") ||
+  (existsSync(conventionsFile) ? readFileSync(conventionsFile, "utf8") : "");
 
 const firstAgentStep = steps.find((s) => s.type === "agent")?.id ?? steps[0].id;
 
@@ -231,12 +235,14 @@ function buildPrompt(step, role) {
   const base = step.prompt
     ? interpolate(step.prompt)
     : (DEFAULT_PROMPTS[role] ?? DEFAULT_PROMPTS._act)();
-  // SOFT gates get the repo's conventions.md appended as a review rubric
-  const rubric =
-    step.gate && conventions
-      ? `\n\n--- REVIEW RUBRIC (.taw-case/conventions.md) ---\n${conventions}\n--- end rubric ---\nJudge the diff against EVERY rule above; cite file:line for each issue.`
-      : "";
-  return base + rubric + commonContext(role);
+  // inject conventions into steps that opt in (conventions: true) and into every
+  // SOFT gate (the reviewer's rubric). `conventions: false` opts a gate out.
+  const wantConv = conventions && step.conventions !== false && (step.conventions === true || step.gate);
+  const convBlock = wantConv
+    ? `\n\n--- PROJECT CONVENTIONS ---\n${conventions}\n--- end conventions ---` +
+      (step.gate ? `\nJudge the diff against EVERY rule above; cite file:line for each issue.` : "")
+    : "";
+  return base + convBlock + commonContext(role);
 }
 
 function commonContext(role) {
