@@ -288,8 +288,15 @@ const DEFAULT_PROMPTS = {
 
 async function runAgent(role, step, prompt) {
   const rolePrompt = `You are taw-case/${role}, one subprocess in a deterministic harness.`;
-  // sensible defaults for Pi; override via config.agent.args for other CLIs
-  const base = config.agent?.args ?? ["--no-session", "-p", "--append-system-prompt", rolePrompt];
+  // sensible defaults for Pi; override via config.agent.args for other CLIs.
+  // --no-context-files / --no-skills keep spawns DETERMINISTIC and fast: no
+  // auto-loading the repo's CLAUDE.md or wandering skill discovery (that made
+  // runs take 20+ min). Conventions come from our injected prompt; skills are
+  // opt-in via config `skills:` (explicit --skill loads even with discovery off).
+  const base = config.agent?.args ?? [
+    "--no-session", "-p", "--no-context-files", "--no-skills",
+    "--append-system-prompt", rolePrompt,
+  ];
   const extra = [];
   const tools = step.tools ?? config.agent?.tools;
   if (tools && agentCmd.includes("pi")) extra.push("--tools", Array.isArray(tools) ? tools.join(",") : tools);
