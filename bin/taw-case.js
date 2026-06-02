@@ -670,8 +670,12 @@ MODEL
 }
 
 // ---- entrypoint (kept last so all top-level consts are initialized) --------
-await run().catch((err) => {
+try {
+  await run();
+  process.exit(0); // force-exit: lingering agent child handles would otherwise
+                   // keep the event loop alive and "hang" after ✓ DONE
+} catch (err) {
   console.error(`\n[taw-case] fatal: ${err?.stack ?? err}`);
   try { writeManifest(false); } catch {}
   process.exit(1);
-});
+}
