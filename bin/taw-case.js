@@ -544,3 +544,10 @@ MODEL
   burns a cycle. Evidence lands in .taw-case/runs/<id>/.
 `);
 }
+
+// ---- entrypoint (kept last so all top-level consts are initialized) --------
+await run().catch((err) => {
+  console.error(`\n[taw-case] fatal: ${err?.stack ?? err}`);
+  try { writeManifest(false); } catch {}
+  process.exit(1);
+});
