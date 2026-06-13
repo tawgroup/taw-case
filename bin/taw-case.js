@@ -322,8 +322,12 @@ async function runAgent(role, step, prompt) {
   ];
   const extra = [];
   const tools = step.tools ?? config.agent?.tools;
-  if (tools && agentCmd.includes("pi")) extra.push("--tools", Array.isArray(tools) ? tools.join(",") : tools);
+  // per-step tool scoping: pi and tawx both honour --tools (a reviewer with no
+  // edit/write then PHYSICALLY can't change code). Other CLIs ignore it.
+  const supportsTools = agentCmd.includes("pi") || agentCmd.includes("tawx");
+  if (tools && supportsTools) extra.push("--tools", Array.isArray(tools) ? tools.join(",") : tools);
   // skills: global (agent.skills) + per-step (step.skills). Each → one --skill <path>.
+  // pi-only: tawx has no skill system (it just folds context into the prompt).
   if (agentCmd.includes("pi")) {
     for (const s of [...(config.agent?.skills ?? []), ...(step.skills ?? [])]) extra.push("--skill", s);
   }
